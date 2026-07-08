@@ -11,15 +11,23 @@ Exit codes: 0 = Drupal confirmed, 1 = not Drupal / unknown, 2 = error
 # ─── Section 1: Imports ───────────────────────────────────────────────────────
 
 import argparse
+import csv
 import ipaddress
+import os
 import re
 import socket
 import sys
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait as cf_wait
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
+
+try:
+    from tqdm import tqdm as _tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
 
 # Must be registered before `import requests` — the warning fires at import time
 warnings.filterwarnings("ignore", message=r"urllib3 \(")
@@ -173,7 +181,7 @@ def validate_url(url: str) -> tuple[bool, str | None]:
 
 # ─── Section 5: HTTP Session Factory ─────────────────────────────────────────
 
-def make_session(args: argparse.Namespace) -> requests.Session:
+def make_session(args: argparse.Namespace, pool_workers: int = 1) -> requests.Session:
     retry = Retry(
         total=args.retries,
         connect=args.retries,
@@ -183,7 +191,13 @@ def make_session(args: argparse.Namespace) -> requests.Session:
         allowed_methods=["GET"],
         raise_on_status=False,
     )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=12)
+    # Each worker opens up to 7 parallel probe connections; size the pool accordingly
+    pool_size = max(12, pool_workers * 8)
+    adapter = HTTPAdapter(
+        max_retries=retry,
+        pool_connections=min(pool_workers + 2, 20),
+        pool_maxsize=pool_size,
+    )
     session = requests.Session()
     session.mount("https://", adapter)
     session.mount("http://",  adapter)
@@ -215,12 +229,16 @@ def fetch(
         resp = session.get(url, timeout=(timeout, timeout), stream=True, allow_redirects=True)
         chunks: list[bytes] = []
         received = 0
+        deadline = time.monotonic() + timeout * 2  # hard wall-clock cap on total read
         for chunk in resp.iter_content(chunk_size=8192):
             if chunk:
                 chunks.append(chunk)
                 received += len(chunk)
                 if received >= max_size:
                     break
+            if time.monotonic() > deadline:
+                dprint(f"GET {url} — read deadline exceeded, truncating")
+                break
         resp._content = b"".join(chunks)
         if not resp.encoding:
             resp.encoding = resp.apparent_encoding or "utf-8"
@@ -438,14 +456,18 @@ def _probe_get(
 def probe_misc_drupal_js(session, base_url, timeout) -> Signal | None:
     resp = _probe_get(session, f"{base_url}/misc/drupal.js", timeout, PROBE_SIZE_JS)
     if resp:
-        return Signal("misc_drupal_js", TIER_STRONG, None, "probe_misc_drupal_js")
+        body = resp.text or ""
+        if "Drupal.behaviors" in body or "Drupal.settings" in body or "Drupal.theme" in body:
+            return Signal("misc_drupal_js", TIER_STRONG, None, "probe_misc_drupal_js")
     return None
 
 
 def probe_core_drupal_js(session, base_url, timeout) -> Signal | None:
-    resp = _probe_get(session, f"{base_url}/core/misc/drupal.js", timeout, PROBE_SIZE_STATUS)
+    resp = _probe_get(session, f"{base_url}/core/misc/drupal.js", timeout, PROBE_SIZE_JS)
     if resp:
-        return Signal("core_drupal_js", TIER_STRONG, None, "probe_core_drupal_js")
+        body = resp.text or ""
+        if "Drupal.behaviors" in body or "drupalSettings" in body or "Drupal.theme" in body:
+            return Signal("core_drupal_js", TIER_STRONG, None, "probe_core_drupal_js")
     return None
 
 
@@ -787,7 +809,65 @@ def format_result(result: DrupalResult, drupal_only: bool = False) -> str:
     return f"Unknown{block_note}"
 
 
-# ─── Section 12: Argument Parser + Main ──────────────────────────────────────
+# ─── Section 12: CSV Batch Processor ─────────────────────────────────────────
+
+def process_csv(args: argparse.Namespace, session: requests.Session) -> None:
+    base, ext = os.path.splitext(args.input)
+    output_path = f"{base}_output{ext}"
+
+    with open(args.input, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            print("Error: CSV has no header row", file=sys.stderr)
+            sys.exit(2)
+        fieldnames = list(reader.fieldnames)
+        rows = list(reader)
+
+    if args.domain_col not in fieldnames:
+        print(f"Error: column '{args.domain_col}' not found. Available: {fieldnames}",
+              file=sys.stderr)
+        sys.exit(2)
+
+    def check_row(row: dict) -> str:
+        domain = (row.get(args.domain_col) or "").strip()
+        if not domain:
+            return "Error: empty domain"
+        result = detect_drupal(domain, session, args)
+        return format_result(result, drupal_only=args.drupal_only)
+
+    ordered: list[str | None] = [None] * len(rows)
+    progress = _tqdm(total=len(rows), unit="url") if TQDM_AVAILABLE else None
+
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        future_to_idx = {ex.submit(check_row, row): i for i, row in enumerate(rows)}
+        done = 0
+        for future in as_completed(future_to_idx):
+            i = future_to_idx[future]
+            try:
+                ordered[i] = future.result()
+            except Exception as e:
+                ordered[i] = f"Error: {e}"
+            done += 1
+            if progress:
+                progress.update(1)
+            elif not args.debug:
+                print(f"\r{done}/{len(rows)}", end="", file=sys.stderr)
+
+    if progress:
+        progress.close()
+    elif not args.debug:
+        print(file=sys.stderr)
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["drupal_result"] + fieldnames)
+        writer.writeheader()
+        for i, row in enumerate(rows):
+            writer.writerow({"drupal_result": ordered[i], **row})
+
+    print(f"Wrote {len(rows)} rows → {output_path}", file=sys.stderr)
+
+
+# ─── Section 13: Argument Parser + Main ──────────────────────────────────────
 
 def _run_probes_parallel(
     base_url: str,
@@ -805,9 +885,14 @@ def _run_probes_parallel(
     }
 
     signals: list[Signal] = []
-    with ThreadPoolExecutor(max_workers=len(tasks)) as ex:
+    # Hard deadline: probes must finish within probe_timeout + a small buffer.
+    # shutdown(wait=False) lets stuck threads die on their own without blocking here.
+    hard_limit = probe_timeout + 5
+    ex = ThreadPoolExecutor(max_workers=len(tasks))
+    try:
         future_to_name = {ex.submit(fn): name for name, fn in tasks.items()}
-        for future in as_completed(future_to_name):
+        done, not_done = cf_wait(list(future_to_name), timeout=hard_limit)
+        for future in done:
             probe_name = future_to_name[future]
             try:
                 result = future.result()
@@ -823,6 +908,11 @@ def _run_probes_parallel(
                     signals.append(result)
             except Exception as e:
                 dprint(f"  probe {probe_name}: exception — {e}")
+        for future in not_done:
+            dprint(f"  probe {future_to_name[future]}: timed out after {hard_limit}s")
+            future.cancel()
+    finally:
+        ex.shutdown(wait=False)
     return signals
 
 
@@ -838,7 +928,15 @@ def build_parser() -> argparse.ArgumentParser:
             "  %(prog)s --drupal-only https://example.com\n"
         ),
     )
-    parser.add_argument("url", metavar="URL", help="Target URL to check")
+    parser.add_argument("url", metavar="URL", nargs="?", help="Target URL to check")
+
+    batch = parser.add_argument_group("Batch / CSV options")
+    batch.add_argument("-i", "--input", metavar="FILE",
+        help="CSV file to read domains from (output written to FILE_output.EXT)")
+    batch.add_argument("--domain-col", default="domain", metavar="COL",
+        help="CSV column containing the domain/URL (default: 'domain')")
+    batch.add_argument("-w", "--workers", type=int, default=10, metavar="N",
+        help="Concurrent workers for batch mode (default: 10)")
 
     scope = parser.add_argument_group("Detection scope")
     scope.add_argument(
@@ -913,17 +1011,25 @@ def main() -> None:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         print("WARNING: SSL verification disabled", file=sys.stderr)
 
-    session = make_session(args)
+    if not args.input and not args.url:
+        parser.error("provide a URL or --input FILE")
+    if args.input and args.url:
+        parser.error("provide a URL or --input FILE, not both")
 
-    result = detect_drupal(args.url, session, args)
-    print(format_result(result, drupal_only=args.drupal_only))
+    workers = args.workers if args.input else 1
+    session = make_session(args, pool_workers=workers)
 
-    if result.error:
-        sys.exit(2)
-    elif result.is_drupal is True:
-        sys.exit(0)
+    if args.input:
+        process_csv(args, session)
     else:
-        sys.exit(1)
+        result = detect_drupal(args.url, session, args)
+        print(format_result(result, drupal_only=args.drupal_only))
+        if result.error:
+            sys.exit(2)
+        elif result.is_drupal is True:
+            sys.exit(0)
+        else:
+            sys.exit(1)
 
 
 if __name__ == "__main__":
