@@ -4,6 +4,97 @@ Determine if a given URL points to a Drupal site or not. Determine if the site i
 
 ---
 
+## Two ways to run it
+
+### Web app (`app.py`)
+
+A single-page Flask UI. Check one URL, or upload a CSV (which **must** contain a
+`domain` column) and watch results stream in behind a progress bar, then
+download an annotated results CSV. It is password-gated and includes an SSRF
+guard — requests to private/reserved hosts (`127.0.0.1`, `10.x`,
+`169.254.169.254`, …) are refused — because it is intended to run on a public
+host.
+
+```bash
+./run.sh          # -> http://127.0.0.1:5000, sign in with password "test"
+```
+
+`run.sh` documents the environment variables (`ISDRUPAL_PASSWORD`, `SECRET_KEY`,
+`PORT`, `ISDRUPAL_WORKERS`). For deployment, run it under gunicorn with a
+**single worker**:
+
+```bash
+ISDRUPAL_PASSWORD=secret gunicorn --workers 1 --threads 8 --timeout 120 app:app
+```
+
+The single-worker requirement is because CSV job progress is tracked in an
+in-memory registry that is not shared across processes (threads give you
+concurrency; processes each get a private copy). See `isdrupal/security.py` for
+the opt-in path to a shared (Redis) store when you outgrow one worker.
+
+### Command line (`isDrupal_threaded.py`)
+
+```bash
+python3 isDrupal_threaded.py https://example.com           # check one URL
+python3 isDrupal_threaded.py https://example.com -v        # + list matched signals
+python3 isDrupal_threaded.py --fast https://example.com    # homepage only, skip probes
+python3 isDrupal_threaded.py --drupal-only https://ex.com  # confirm Drupal, skip version
+python3 isDrupal_threaded.py -i domains.csv -w 20          # batch; writes domains_output.csv
+```
+
+Useful flags: `--fast`, `--drupal-only`, `--timeout`, `--probe-timeout`,
+`--retries`, `-w/--workers`, `--user-agent`, `--proxy`, `--no-verify-ssl`,
+`--browser-fallback`, `-v/--verbose`, `-d/--debug`. Exit codes: **0** = Drupal,
+**1** = not Drupal / unknown, **2** = error.
+
+In CSV mode it reads the `--domain-col` column (default `domain`), checks every
+row concurrently (`-w/--workers`), and writes `<input>_output.csv` — a new
+`drupal_result` column prepended to all the original columns, in the original
+row order.
+
+---
+
+## Code layout
+
+The detection engine lives in the `isdrupal/` package and is shared by both
+front-ends, so the CLI and the web app run identical logic:
+
+```
+isdrupal/
+  config.py    DetectConfig — the settings object both front-ends build
+  core.py      the engine: signals, probes, phase logic, detect_drupal, format_result
+  batch.py     run_batch() — concurrent multi-domain runner (preserves input order)
+  security.py  SSRF guard (used by the web app) + opt-in rate-limit/caps/concurrency
+isDrupal_threaded.py   thin CLI over the package
+app.py                 Flask web app over the package
+isDrupal.py            standalone reference/test script (deliberately not wired to the package)
+```
+
+---
+
+## Version detection in this release
+
+Fixes so that a *confirmed* Drupal site reports its actual version instead of a
+bare "Drupal":
+
+- **Exact major is honored.** A version parsed from the `<meta generator>` tag,
+  the `X-Generator` header, or a CHANGELOG now flows all the way to the output.
+  (Previously these strong signals could still print just "Drupal" with no
+  version.)
+- **`X-Generator` header version is parsed.** `X-Generator: Drupal 7 (...)` now
+  reports "Drupal 7", not just "Drupal" — the header, not only the meta tag, is
+  mined for the number.
+- **Exact minor from CHANGELOG.** The first CHANGELOG line (e.g. `Drupal 7.101`
+  or `Drupal 10.3.6`) is parsed to the full `major.minor[.patch]`, so output can
+  read "Drupal 10.3.6".
+- **`/core/CHANGELOG.txt` is probed.** Drupal 8+ moved the changelog under
+  `/core/`; probing that path recovers the exact minor of a modern install. The
+  old code only checked `/CHANGELOG.txt`, which is the D6/D7 location.
+- Probes run in parallel, and batch mode uses a dedicated HTTP session per
+  domain so concurrent checks can't bleed state into one another.
+
+---
+
 ## Detection Algorithm
 
 The detection runs in three phases. Each phase builds on the last; stop early if you reach high confidence.
@@ -121,10 +212,10 @@ The internal version number is the only truly reliable differentiator here; many
 
 Minimise round-trips by parallelising probes 2–6:
 
-1. `GET /` — parse HTML + response headers (covers meta generator, X-Generator, X-Drupal-Cache, JS globals, body classes, cookies, field classes, data-drupal-* attributes)
+1. `GET /` — parse HTML + response headers (covers meta generator **and its version number**, `X-Generator` **and its version number**, X-Drupal-Cache, JS globals, body classes, cookies, field classes, data-drupal-* attributes)
 2. `GET /misc/drupal.js` — HTTP 200 → D6/D7; 404 → likely D8+
 3. `GET /core/misc/drupal.js` — HTTP 200 → D8+; 404 → not D8+
-4. `GET /CHANGELOG.txt` — parse first line for version (may be 403/404)
+4. `GET /CHANGELOG.txt` (D6/D7) **and `GET /core/CHANGELOG.txt` (D8+)** — parse first line for the exact `major.minor[.patch]` version (may be 403/404)
 5. `GET /sites/default/files/` — 200/403 → Drupal signal
 6. `GET /user/login` — parse form for Drupal-specific field IDs
 
