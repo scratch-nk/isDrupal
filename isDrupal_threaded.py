@@ -17,6 +17,7 @@ import re
 import sys
 import time
 import warnings
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait as cf_wait
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
@@ -144,7 +145,7 @@ def validate_url(url: str) -> tuple[bool, str | None]:
 
 # ─── Section 5: HTTP Session Factory ─────────────────────────────────────────
 
-def make_session(args: argparse.Namespace, pool_workers: int = 1) -> requests.Session:
+def make_session(args: argparse.Namespace, pool_workers: int = 8) -> requests.Session:
     retry = Retry(
         total=args.retries,
         connect=args.retries,
@@ -162,12 +163,13 @@ def make_session(args: argparse.Namespace, pool_workers: int = 1) -> requests.Se
         # rely on our own (capped) exponential backoff instead.
         respect_retry_after_header=False,
     )
-    # Each worker opens up to 7 parallel probe connections; size the pool accordingly
-    pool_size = max(12, pool_workers * 8)
+    # Each session now belongs to a single row: one homepage fetch plus up to
+    # 7 concurrent probes against that same host. Size the pool for that peak,
+    # not overall batch concurrency (batch concurrency = one session per row).
     adapter = HTTPAdapter(
         max_retries=retry,
-        pool_connections=min(pool_workers + 2, 20),
-        pool_maxsize=pool_size,
+        pool_connections=4,
+        pool_maxsize=max(10, pool_workers),
     )
     session = requests.Session()
     session.mount("https://", adapter)
@@ -744,8 +746,8 @@ def detect_drupal(raw_url: str, session: requests.Session, args: argparse.Namesp
 
     # Run probes unless --fast (probes inform both detection AND version)
     if not args.fast:
-        dprint("Running probes...")
-        probe_signals = _run_probes(final_base, session, args.probe_timeout)
+        dprint("Running probes in parallel...")
+        probe_signals = _run_probes_parallel(final_base, session, args.probe_timeout)
         signals.extend(probe_signals)
         dprint(f"Probe signals ({len(probe_signals)}): "
                f"{[s.name for s in probe_signals] if probe_signals else 'none'}")
@@ -837,7 +839,7 @@ def _count_data_rows(path: str) -> int:
         return max(sum(1 for _ in csv.reader(f)) - 1, 0)  # exclude header row
 
 
-def process_csv(args: argparse.Namespace, session: requests.Session) -> None:
+def process_csv(args: argparse.Namespace) -> None:
     base, ext = os.path.splitext(args.input)
     output_path = f"{base}_output{ext}"
 
@@ -845,6 +847,10 @@ def process_csv(args: argparse.Namespace, session: requests.Session) -> None:
         domain = (row.get(args.domain_col) or "").strip()
         if not domain:
             return "Error: empty domain"
+        # A dedicated session per row — never shared across concurrently
+        # running rows/threads — so different domains can never bleed
+        # cookies/adapter state into each other.
+        session = make_session(args)
         result = detect_drupal(domain, session, args)
         return format_result(result, drupal_only=args.drupal_only, verbose=args.verbose)
 
@@ -868,18 +874,53 @@ def process_csv(args: argparse.Namespace, session: requests.Session) -> None:
 
         progress = _tqdm(total=total, unit="url") if TQDM_AVAILABLE else None
         done = 0
-        for row in reader:
-            try:
-                drupal_result = check_row(row)
-            except Exception as e:
-                drupal_result = f"Error: {e}"
-            writer.writerow({"drupal_result": drupal_result, **row})
-            out_f.flush()
-            done += 1
-            if progress is not None:
-                progress.update(1)
-            elif not args.debug:
-                print(f"\r{done}/{total}", end="", file=sys.stderr)
+
+        # Rows are read lazily (never materialized into a list) and fed into
+        # the executor through a bounded sliding window so memory stays
+        # O(workers) instead of O(rows). Completions can arrive out of order,
+        # so they're buffered in `pending` just long enough to flush rows to
+        # disk in original input order.
+        row_iter = enumerate(reader)
+        pending: dict[int, tuple[str, dict]] = {}
+        next_idx = 0
+
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            in_flight: dict[object, tuple[int, dict]] = {}
+
+            def submit_next() -> bool:
+                try:
+                    idx, row = next(row_iter)
+                except StopIteration:
+                    return False
+                in_flight[ex.submit(check_row, row)] = (idx, row)
+                return True
+
+            for _ in range(args.workers * 2):
+                if not submit_next():
+                    break
+
+            while in_flight:
+                finished, _ = cf_wait(list(in_flight), return_when=FIRST_COMPLETED)
+                for future in finished:
+                    idx, row = in_flight.pop(future)
+                    try:
+                        drupal_result = future.result()
+                    except Exception as e:
+                        drupal_result = f"Error: {e}"
+                    pending[idx] = (drupal_result, row)
+
+                    while next_idx in pending:
+                        result, out_row = pending.pop(next_idx)
+                        writer.writerow({"drupal_result": result, **out_row})
+                        out_f.flush()
+                        next_idx += 1
+                        done += 1
+                        if progress is not None:
+                            progress.update(1)
+                        elif not args.debug:
+                            print(f"\r{done}/{total}", end="", file=sys.stderr)
+
+                    submit_next()
 
         if progress is not None:
             progress.close()
@@ -891,7 +932,7 @@ def process_csv(args: argparse.Namespace, session: requests.Session) -> None:
 
 # ─── Section 13: Argument Parser + Main ──────────────────────────────────────
 
-def _run_probes(
+def _run_probes_parallel(
     base_url: str,
     session: requests.Session,
     probe_timeout: float,
@@ -907,23 +948,30 @@ def _run_probes(
         "jsonapi":             lambda: probe_jsonapi(session, base_url, probe_timeout),
     }
 
+    # All 7 probes hit the same host as each other (safe to share `session`
+    # concurrently) and every one of them is bounded by probe_timeout plus a
+    # capped retry backoff (see make_session) — so a plain wait-for-all here
+    # can't hang, unlike the old hard_limit/abandon-thread approach.
     signals: list[Signal] = []
-    for probe_name, fn in tasks.items():
-        try:
-            result = fn()
-        except Exception as e:
-            dprint(f"  probe {probe_name}: exception — {e}")
-            continue
-        if result is None:
-            dprint(f"  probe {probe_name}: no signal")
-        elif isinstance(result, list):
-            names = [s.name for s in result] if result else ["no signal"]
-            dprint(f"  probe {probe_name}: {names}")
-            signals.extend(result)
-        else:
-            dprint(f"  probe {probe_name}: {result.name} [{result.tier}]"
-                   + (f" = {result.value}" if result.value else ""))
-            signals.append(result)
+    with ThreadPoolExecutor(max_workers=len(tasks)) as ex:
+        future_to_name = {ex.submit(fn): name for name, fn in tasks.items()}
+        for future in as_completed(future_to_name):
+            probe_name = future_to_name[future]
+            try:
+                result = future.result()
+            except Exception as e:
+                dprint(f"  probe {probe_name}: exception — {e}")
+                continue
+            if result is None:
+                dprint(f"  probe {probe_name}: no signal")
+            elif isinstance(result, list):
+                names = [s.name for s in result] if result else ["no signal"]
+                dprint(f"  probe {probe_name}: {names}")
+                signals.extend(result)
+            else:
+                dprint(f"  probe {probe_name}: {result.name} [{result.tier}]"
+                       + (f" = {result.value}" if result.value else ""))
+                signals.append(result)
     return signals
 
 
@@ -946,6 +994,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="CSV file to read domains from (output written to FILE_output.EXT)")
     batch.add_argument("--domain-col", default="domain", metavar="COL",
         help="CSV column containing the domain/URL (default: 'domain')")
+    batch.add_argument("-w", "--workers", type=int, default=10, metavar="N",
+        help="Concurrent domains to check in batch mode (default: 10)")
 
     scope = parser.add_argument_group("Detection scope")
     scope.add_argument(
@@ -1018,6 +1068,8 @@ def main() -> None:
         parser.error("--probe-timeout must be positive")
     if args.retries < 0:
         parser.error("--retries must be >= 0")
+    if args.workers < 1:
+        parser.error("--workers must be >= 1")
 
     if args.no_verify_ssl:
         import urllib3
@@ -1029,11 +1081,10 @@ def main() -> None:
     if args.input and args.url:
         parser.error("provide a URL or --input FILE, not both")
 
-    session = make_session(args)
-
     if args.input:
-        process_csv(args, session)
+        process_csv(args)
     else:
+        session = make_session(args)
         result = detect_drupal(args.url, session, args)
         print(format_result(result, drupal_only=args.drupal_only, verbose=args.verbose))
         if result.error:
