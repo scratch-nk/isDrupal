@@ -71,8 +71,9 @@ def assert_public_url(url: str) -> None:
 
     Used by the web front-end before any fetch. Note: this checks the *initial*
     host only; `detect_drupal` follows redirects, so a public URL could still be
-    redirected to a private one. `SSRFGuardAdapter` (below) closes that gap and
-    should be mounted on the session once enabled.
+    redirected to a private one. `ssrf_safe_get` (below) closes that gap and
+    should be used in place of a plain `session.get(..., allow_redirects=True)`
+    once enabled.
     """
     hostname = urlparse(url).hostname or ""
     if hostname and is_private_ip(hostname):
@@ -166,24 +167,34 @@ def rate_limit(max_calls: int, per_seconds: float):
 
 
 # ── Redirect-aware SSRF guard ─────────────────────────────────────────────────
-def SSRFGuardAdapter():
-    """Return an HTTPAdapter that re-validates every connection's host against
-    `PRIVATE_NETWORKS`, closing the redirect-to-private-IP gap that
-    `assert_public_url` alone leaves open.
+# NOTE: isdrupal.core builds its session via curl_cffi (for TLS/HTTP2 browser
+# impersonation — see core.py), whose Session has no HTTPAdapter/`.mount()` hook to
+# intercept connections transparently the way `requests` + urllib3 did. So instead of
+# an adapter that re-validates every redirect hop under the hood, this walks the
+# redirect chain by hand: request one hop at a time with `allow_redirects=False`,
+# validate the `Location` header's host against `PRIVATE_NETWORKS` before following
+# it, and repeat.
+def ssrf_safe_get(session, url: str, max_redirects: int = 5, **kwargs):
+    """Follow redirects one hop at a time, re-validating each hop's host against
+    `PRIVATE_NETWORKS` before connecting — closes the redirect-to-private-IP gap
+    that `assert_public_url` alone leaves open (it only checks the *initial* URL).
 
-    Enable by mounting on the session in `make_session` (or after building it):
+    Enable by using this instead of `session.get(url, ..., allow_redirects=True)` in
+    `isdrupal.core.fetch()` — see the commented-out call there:
 
-        adapter = SSRFGuardAdapter()
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
+        from isdrupal.security import ssrf_safe_get
+        resp = ssrf_safe_get(session, url, timeout=(timeout, timeout), stream=True)
     """
-    from requests.adapters import HTTPAdapter
+    from urllib.parse import urljoin
 
-    class _Guard(HTTPAdapter):
-        def send(self, request, **kwargs):
-            host = urlparse(request.url).hostname or ""
-            if host and is_private_ip(host):
-                raise SSRFError(f"Blocked redirect to private host '{host}'.")
-            return super().send(request, **kwargs)
-
-    return _Guard()
+    current_url = url
+    for _ in range(max_redirects + 1):
+        assert_public_url(current_url)
+        resp = session.get(current_url, allow_redirects=False, **kwargs)
+        if resp.status_code not in (301, 302, 303, 307, 308):
+            return resp
+        location = resp.headers.get("Location")
+        if not location:
+            return resp
+        current_url = urljoin(current_url, location)
+    raise SSRFError(f"Too many redirects while re-validating host safety (>{max_redirects}).")

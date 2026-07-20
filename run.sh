@@ -26,7 +26,7 @@ cd "$(dirname "$0")"
 # --- Settings you will most likely want to change ---
 export ISDRUPAL_PASSWORD="${ISDRUPAL_PASSWORD:-test}"   # <-- CHANGE for anything but local testing
 export SECRET_KEY="${SECRET_KEY:-dev-secret-change-me}"
-export PORT="${PORT:-5000}"
+export PORT="${PORT:-8000}"
 
 # One-time dependency install (uncomment if this is a fresh checkout):
 # pip install -r requirements.txt
@@ -35,7 +35,7 @@ echo "isDrupal web app -> http://127.0.0.1:${PORT}  (login password: ${ISDRUPAL_
 
 # ── Local dev server (single process, auto-threaded) ──────────────────────────
 # Fine for local testing. This is what runs by default.
-exec python3 app.py
+# exec python3 app.py
 
 # ── Production alternative (uncomment the block below, comment out the line
 #    above) ──────────────────────────────────────────────────────────────────
@@ -46,4 +46,4 @@ exec python3 app.py
 # processes do not. To scale past one worker, move the job store to Redis (see
 # isdrupal/security.py).
 #
-# exec gunicorn --workers 1 --threads 8 --timeout 120 --bind "0.0.0.0:${PORT}" app:app
+exec gunicorn --workers 1 --threads 8 --timeout 120 --bind "0.0.0.0:${PORT}" app:app

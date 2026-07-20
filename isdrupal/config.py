@@ -8,9 +8,14 @@ whether it was invoked from a terminal or an HTTP request.
 from dataclasses import dataclass
 
 # ── User-facing defaults (canonical home; the CLI reuses these for argparse) ──
+# Must match DEFAULT_IMPERSONATE below: curl_cffi sets this exact UA (plus the full
+# Sec-Ch-Ua/Sec-Fetch-* header set) whenever it impersonates this Chrome target, so
+# the two are two views of the same fingerprint, not independent settings.
 DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 )
+DEFAULT_IMPERSONATE   = "chrome146"
 DEFAULT_TIMEOUT       = 10
 DEFAULT_PROBE_TIMEOUT = 5
 DEFAULT_RETRIES       = 2
@@ -29,6 +34,7 @@ class DetectConfig:
     probe_timeout:   float = DEFAULT_PROBE_TIMEOUT
     retries:         int   = DEFAULT_RETRIES
     user_agent:      str   = DEFAULT_USER_AGENT
+    impersonate:     str   = DEFAULT_IMPERSONATE
     no_verify_ssl:   bool  = False
     proxy:           str | None = None
     browser_fallback: bool = False   # open Chromium on WAF block (CLI only)

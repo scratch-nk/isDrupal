@@ -1,4 +1,5 @@
-requests>=2.31.0
+requests>=2.31.0   # still used directly by the legacy isDrupal.py script
+curl_cffi>=0.15.0  # TLS/HTTP2 browser impersonation for isdrupal.core (Cloudflare fingerprinting)
 beautifulsoup4>=4.12.0
 lxml>=4.9.0        # optional: faster HTML parsing; falls back to html.parser if absent
 tqdm>=4.66.0       # optional: CLI batch progress bar

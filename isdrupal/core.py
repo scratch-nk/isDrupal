@@ -19,11 +19,14 @@ from urllib.parse import urlparse
 
 from .config import DetectConfig
 
-# Must be registered before `import requests` — the warning fires at import time
+# Must be registered before importing requests — the warning fires at import time
 warnings.filterwarnings("ignore", message=r"urllib3 \(")
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+# curl_cffi's `requests` submodule mirrors the real `requests` API (Session, Response,
+# exceptions) but drives libcurl underneath with a patched TLS/HTTP2 stack, so the
+# ClientHello + HTTP2 SETTINGS/header-order fingerprint actually matches the browser
+# identity we claim via `impersonate=` — plain `requests`/OpenSSL never does, which is
+# what gets flagged by Cloudflare-class bot detection even for a benign homepage GET.
+from curl_cffi import requests
 
 try:
     from bs4 import BeautifulSoup
@@ -137,38 +140,22 @@ def validate_url(url: str) -> tuple[bool, str | None]:
 
 # ─── Section 5: HTTP Session Factory ─────────────────────────────────────────
 
-def make_session(cfg: DetectConfig, pool_workers: int = 8) -> requests.Session:
-    retry = Retry(
-        total=cfg.retries,
-        connect=cfg.retries,
-        read=cfg.retries,
-        backoff_factor=0.4,
-        # 429/503 mean "you're being rate-limited/blocked" (common on WAF-protected
-        # sites) — retrying against an active block is futile, so only retry on
-        # genuine transient server errors.
-        status_forcelist=[500, 502, 504],
-        allowed_methods=["GET"],
-        raise_on_status=False,
-        # Some WAFs send a Retry-After header of minutes/hours on block responses
-        # specifically to punish scrapers. Honoring it would sleep far past
-        # --timeout with no way for our code to interrupt it, so ignore it and
-        # rely on our own (capped) exponential backoff instead.
-        respect_retry_after_header=False,
+def make_session(cfg: DetectConfig) -> requests.Session:
+    # No HTTPAdapter/mount/pool concept in curl_cffi — each Session drives its own
+    # libcurl handle(s) directly, and retries are handled per-request in fetch()
+    # instead of at an adapter layer (see the retry loop there for the same
+    # 500/502/504-only, ignore-Retry-After policy the old urllib3 Retry encoded).
+    #
+    # Deliberately NOT setting a `headers["User-Agent"]` override here: `impersonate`
+    # already installs a full, internally-consistent header set (UA + Sec-Ch-Ua +
+    # Sec-Fetch-*) that matches the TLS/HTTP2 fingerprint it produces. Overriding just
+    # the UA string would reintroduce the exact claimed-identity-vs-transport mismatch
+    # this module exists to close.
+    session = requests.Session(
+        impersonate=cfg.impersonate,
+        verify=not cfg.no_verify_ssl,
+        max_redirects=DEFAULT_MAX_REDIRECTS,
     )
-    # Each session belongs to a single row: one homepage fetch plus up to
-    # 7 concurrent probes against that same host. Size the pool for that peak,
-    # not overall batch concurrency (batch concurrency = one session per row).
-    adapter = HTTPAdapter(
-        max_retries=retry,
-        pool_connections=4,
-        pool_maxsize=max(10, pool_workers),
-    )
-    session = requests.Session()
-    session.mount("https://", adapter)
-    session.mount("http://",  adapter)
-    session.headers["User-Agent"] = cfg.user_agent
-    session.verify = not cfg.no_verify_ssl
-    session.max_redirects = DEFAULT_MAX_REDIRECTS
     if cfg.proxy:
         session.proxies = {"http": cfg.proxy, "https": cfg.proxy}
     return session
@@ -188,46 +175,80 @@ def fetch(
     url: str,
     timeout: float,
     max_size: int,
-) -> tuple[requests.Response | None, str | None]:
-    t0 = time.monotonic()
-    try:
-        resp = session.get(url, timeout=(timeout, timeout), stream=True, allow_redirects=True)
-        chunks: list[bytes] = []
-        received = 0
-        deadline = time.monotonic() + timeout * 2  # hard wall-clock cap on total read
-        for chunk in resp.iter_content(chunk_size=8192):
-            if chunk:
-                chunks.append(chunk)
-                received += len(chunk)
-                if received >= max_size:
-                    break
-            if time.monotonic() > deadline:
-                dprint(f"GET {url} — read deadline exceeded, truncating")
+    retries: int = 0,
+) -> tuple[requests.Response | None, str, str | None]:
+    """GET `url`, capped to `max_size` bytes, retrying transient failures up to
+    `retries` times.
+
+    curl_cffi has no HTTPAdapter/mount layer to hang a urllib3 `Retry` off of, so the
+    same policy the old adapter encoded is reimplemented here by hand: only retry
+    connection errors, timeouts, and 500/502/504 (a 429/503 means "you're being
+    rate-limited/blocked" — retrying an active block is futile); ignore any
+    `Retry-After` header (some WAFs set it to minutes/hours specifically to punish
+    scrapers, which would sleep far past `timeout` with no way to interrupt it); and
+    cap backoff at a fixed schedule instead of honoring server-suggested delays.
+
+    Returns `(resp, text, error)`. `text` is the body decoded from the truncated byte
+    stream directly (curl_cffi's `Response.text`/`.content` reflect whatever the
+    underlying transfer completed with, not a truncated-and-then-re-decoded view, so
+    the truncated text is tracked separately here rather than written back onto the
+    Response object).
+    """
+    backoff = 0.4
+    for attempt in range(retries + 1):
+        t0 = time.monotonic()
+        try:
+            resp = session.get(url, timeout=(timeout, timeout), stream=True, allow_redirects=True)
+        except requests.exceptions.SSLError as e:
+            err = f"SSL error: {_short_exc(e)}"
+            dprint(f"GET {url} → {err} ({time.monotonic()-t0:.2f}s)")
+            return None, "", err
+        except requests.exceptions.ConnectionError as e:
+            if attempt < retries:
+                dprint(f"GET {url} → connection error, retrying (attempt {attempt+1}/{retries})")
+                time.sleep(backoff); backoff *= 2
+                continue
+            err = f"Connection error: {_short_exc(e)}"
+            dprint(f"GET {url} → {err} ({time.monotonic()-t0:.2f}s)")
+            return None, "", err
+        except requests.exceptions.Timeout:
+            if attempt < retries:
+                dprint(f"GET {url} → timeout, retrying (attempt {attempt+1}/{retries})")
+                time.sleep(backoff); backoff *= 2
+                continue
+            dprint(f"GET {url} → Timeout ({time.monotonic()-t0:.2f}s)")
+            return None, "", "Timeout"
+        except requests.exceptions.TooManyRedirects:
+            err = f"Too many redirects (max {DEFAULT_MAX_REDIRECTS})"
+            dprint(f"GET {url} → {err}")
+            return None, "", err
+        except requests.exceptions.RequestException as e:
+            err = f"Request error: {_short_exc(e)}"
+            dprint(f"GET {url} → {err}")
+            return None, "", err
+
+        if resp.status_code in (500, 502, 504) and attempt < retries:
+            dprint(f"GET {url} → {resp.status_code}, retrying (attempt {attempt+1}/{retries})")
+            time.sleep(backoff); backoff *= 2
+            continue
+        break
+
+    chunks: list[bytes] = []
+    received = 0
+    deadline = time.monotonic() + timeout * 2  # hard wall-clock cap on total read
+    for chunk in resp.iter_content(chunk_size=8192):
+        if chunk:
+            chunks.append(chunk)
+            received += len(chunk)
+            if received >= max_size:
                 break
-        resp._content = b"".join(chunks)
-        if not resp.encoding:
-            resp.encoding = resp.apparent_encoding or "utf-8"
-        dprint(f"GET {url} → {resp.status_code} ({received} bytes, {time.monotonic()-t0:.2f}s)")
-        return resp, None
-    except requests.exceptions.SSLError as e:
-        err = f"SSL error: {_short_exc(e)}"
-        dprint(f"GET {url} → {err} ({time.monotonic()-t0:.2f}s)")
-        return None, err
-    except requests.exceptions.ConnectionError as e:
-        err = f"Connection error: {_short_exc(e)}"
-        dprint(f"GET {url} → {err} ({time.monotonic()-t0:.2f}s)")
-        return None, err
-    except requests.exceptions.Timeout:
-        dprint(f"GET {url} → Timeout ({time.monotonic()-t0:.2f}s)")
-        return None, "Timeout"
-    except requests.exceptions.TooManyRedirects:
-        err = f"Too many redirects (max {DEFAULT_MAX_REDIRECTS})"
-        dprint(f"GET {url} → {err}")
-        return None, err
-    except requests.exceptions.RequestException as e:
-        err = f"Request error: {_short_exc(e)}"
-        dprint(f"GET {url} → {err}")
-        return None, err
+        if time.monotonic() > deadline:
+            dprint(f"GET {url} — read deadline exceeded, truncating")
+            break
+    encoding = resp.encoding or resp.default_encoding or "utf-8"
+    text = b"".join(chunks).decode(encoding, errors="replace")
+    dprint(f"GET {url} → {resp.status_code} ({received} bytes, {time.monotonic()-t0:.2f}s)")
+    return resp, text, None
 
 
 # ─── Section 7: Homepage Analysers ───────────────────────────────────────────
@@ -251,9 +272,10 @@ def analyze_headers(resp: requests.Response) -> list[Signal]:
     if "x-drupal-dynamic-cache" in headers:
         signals.append(Signal("x_drupal_dynamic_cache", TIER_DEFINITIVE, None, "homepage_header"))
 
-    # Session cookies — check both resp.cookies and the underlying session jar
-    for cookie in resp.cookies:
-        name = cookie.name
+    # Session cookies. curl_cffi's Cookies is dict-like — iterating it yields cookie
+    # *names* directly (unlike requests' RequestsCookieJar, which yields Cookie
+    # objects with a `.name` attribute).
+    for name in resp.cookies:
         if re.match(r"^SSESS[a-f0-9]{32}$", name):
             signals.append(Signal("ssess_cookie", TIER_STRONG, name, "homepage_cookie"))
         elif re.match(r"^SESS[a-f0-9]{32}$", name):
@@ -327,7 +349,7 @@ def analyze_html(html: str, source: str = "homepage_html") -> list[Signal]:
     return signals
 
 
-def detect_block(resp: requests.Response) -> str | None:
+def detect_block(resp: requests.Response, text: str) -> str | None:
     """Identify WAF/CDN interference that may explain missing Drupal signals."""
     h = {k.lower(): v for k, v in resp.headers.items()}
 
@@ -335,7 +357,7 @@ def detect_block(resp: requests.Response) -> str | None:
     if "cf-ray" in h or h.get("server", "").lower() == "cloudflare":
         if resp.status_code in (403, 429, 503):
             return "Cloudflare (blocked)"
-        body = (resp.text or "")[:4096]
+        body = text[:4096]
         if any(tok in body for tok in ("cf-browser-verification", "cf_chl_", "challenge-form",
                                         "Checking your browser", "jschl-answer")):
             return "Cloudflare (JS challenge)"
@@ -350,7 +372,7 @@ def detect_block(resp: requests.Response) -> str | None:
         return "Akamai"
 
     # Generic: blocked with no further identification
-    if resp.status_code in (403, 429) and not (resp.text or "").strip():
+    if resp.status_code in (403, 429) and not text.strip():
         return f"WAF/CDN (HTTP {resp.status_code}, empty body)"
 
     return None
@@ -419,28 +441,27 @@ def _probe_get(
     timeout: float,
     max_size: int,
     allowed_status: set[int] | None = None,
-) -> requests.Response | None:
+    retries: int = 0,
+) -> tuple[requests.Response | None, str]:
     if allowed_status is None:
         allowed_status = {200}
-    resp, _ = fetch(session, url, timeout, max_size)
+    resp, text, _ = fetch(session, url, timeout, max_size, retries=retries)
     if resp is not None and resp.status_code in allowed_status:
-        return resp
-    return None
+        return resp, text
+    return None, ""
 
 
-def probe_misc_drupal_js(session, base_url, timeout) -> Signal | None:
-    resp = _probe_get(session, f"{base_url}/misc/drupal.js", timeout, PROBE_SIZE_JS)
+def probe_misc_drupal_js(session, base_url, timeout, retries=0) -> Signal | None:
+    resp, body = _probe_get(session, f"{base_url}/misc/drupal.js", timeout, PROBE_SIZE_JS, retries=retries)
     if resp:
-        body = resp.text or ""
         if "Drupal.behaviors" in body or "Drupal.settings" in body or "Drupal.theme" in body:
             return Signal("misc_drupal_js", TIER_STRONG, None, "probe_misc_drupal_js")
     return None
 
 
-def probe_core_drupal_js(session, base_url, timeout) -> Signal | None:
-    resp = _probe_get(session, f"{base_url}/core/misc/drupal.js", timeout, PROBE_SIZE_JS)
+def probe_core_drupal_js(session, base_url, timeout, retries=0) -> Signal | None:
+    resp, body = _probe_get(session, f"{base_url}/core/misc/drupal.js", timeout, PROBE_SIZE_JS, retries=retries)
     if resp:
-        body = resp.text or ""
         if "Drupal.behaviors" in body or "drupalSettings" in body or "Drupal.theme" in body:
             return Signal("core_drupal_js", TIER_STRONG, None, "probe_core_drupal_js")
     return None
@@ -472,27 +493,27 @@ def _changelog_signals(text: str, source: str) -> list[Signal]:
     return []
 
 
-def probe_changelog(session, base_url, timeout) -> list[Signal]:
+def probe_changelog(session, base_url, timeout, retries=0) -> list[Signal]:
     # /CHANGELOG.txt is the Drupal 6/7 location (removed from the D8+ docroot).
-    resp = _probe_get(session, f"{base_url}/CHANGELOG.txt", timeout, PROBE_SIZE_CHANGELOG)
+    resp, text = _probe_get(session, f"{base_url}/CHANGELOG.txt", timeout, PROBE_SIZE_CHANGELOG, retries=retries)
     if resp:
-        return _changelog_signals(resp.text or "", "probe_changelog")
+        return _changelog_signals(text, "probe_changelog")
     return []
 
 
-def probe_core_changelog(session, base_url, timeout) -> list[Signal]:
+def probe_core_changelog(session, base_url, timeout, retries=0) -> list[Signal]:
     # Drupal 8+ moved the changelog under /core/; this is where the exact
     # minor version of a modern install is recoverable.
-    resp = _probe_get(session, f"{base_url}/core/CHANGELOG.txt", timeout, PROBE_SIZE_CHANGELOG)
+    resp, text = _probe_get(session, f"{base_url}/core/CHANGELOG.txt", timeout, PROBE_SIZE_CHANGELOG, retries=retries)
     if resp:
-        return _changelog_signals(resp.text or "", "probe_core_changelog")
+        return _changelog_signals(text, "probe_core_changelog")
     return []
 
 
-def probe_sites_default_files(session, base_url, timeout) -> Signal | None:
-    resp = _probe_get(
+def probe_sites_default_files(session, base_url, timeout, retries=0) -> Signal | None:
+    resp, _ = _probe_get(
         session, f"{base_url}/sites/default/files/", timeout, PROBE_SIZE_STATUS,
-        allowed_status={200, 403},
+        allowed_status={200, 403}, retries=retries,
     )
     if resp:
         # 403 = directory exists but Drupal's .htaccess blocked listing → strong Drupal signal
@@ -502,12 +523,11 @@ def probe_sites_default_files(session, base_url, timeout) -> Signal | None:
     return None
 
 
-def probe_user_login(session, base_url, timeout) -> list[Signal]:
-    resp = _probe_get(session, f"{base_url}/user/login", timeout, PROBE_SIZE_HTML)
+def probe_user_login(session, base_url, timeout, retries=0) -> list[Signal]:
+    resp, html = _probe_get(session, f"{base_url}/user/login", timeout, PROBE_SIZE_HTML, retries=retries)
     if not resp:
         return []
     signals = []
-    html = resp.text or ""
     # Form ID check
     if 'id="user-login-form"' in html:
         signals.append(Signal("user_login_form", TIER_STRONG, "user-login-form", "probe_user_login"))
@@ -527,11 +547,10 @@ def probe_user_login(session, base_url, timeout) -> list[Signal]:
     return signals
 
 
-def probe_robots_txt(session, base_url, timeout) -> Signal | None:
-    resp = _probe_get(session, f"{base_url}/robots.txt", timeout, PROBE_SIZE_ROBOTS)
+def probe_robots_txt(session, base_url, timeout, retries=0) -> Signal | None:
+    resp, text = _probe_get(session, f"{base_url}/robots.txt", timeout, PROBE_SIZE_ROBOTS, retries=retries)
     if not resp:
         return None
-    text = resp.text or ""
     drupal_paths = {"/admin/", "/user/register", "/user/password", "/user/login", "/filter/tips"}
     hits = sum(1 for p in drupal_paths if p in text)
     if hits >= 2:
@@ -541,21 +560,20 @@ def probe_robots_txt(session, base_url, timeout) -> Signal | None:
     return None
 
 
-def probe_sites_all(session, base_url, timeout) -> Signal | None:
-    resp = _probe_get(
+def probe_sites_all(session, base_url, timeout, retries=0) -> Signal | None:
+    resp, _ = _probe_get(
         session, f"{base_url}/sites/all/", timeout, PROBE_SIZE_STATUS,
-        allowed_status={200, 403},
+        allowed_status={200, 403}, retries=retries,
     )
     if resp:
         return Signal("sites_all", TIER_WEAK, str(resp.status_code), "probe_sites_all")
     return None
 
 
-def probe_jquery_js(session, base_url, timeout) -> Signal | None:
-    resp = _probe_get(session, f"{base_url}/misc/jquery.js", timeout, PROBE_SIZE_JS)
+def probe_jquery_js(session, base_url, timeout, retries=0) -> Signal | None:
+    resp, text = _probe_get(session, f"{base_url}/misc/jquery.js", timeout, PROBE_SIZE_JS, retries=retries)
     if not resp:
         return None
-    text = resp.text or ""
     m = re.search(r"jQuery(?:\s+JavaScript Library)?\s+v?(\d+\.\d+\.\d+)", text)
     if m:
         ver = m.group(1)
@@ -563,8 +581,8 @@ def probe_jquery_js(session, base_url, timeout) -> Signal | None:
     return None
 
 
-def probe_jsonapi(session, base_url, timeout) -> Signal | None:
-    resp = _probe_get(session, f"{base_url}/jsonapi", timeout, PROBE_SIZE_STATUS)
+def probe_jsonapi(session, base_url, timeout, retries=0) -> Signal | None:
+    resp, _ = _probe_get(session, f"{base_url}/jsonapi", timeout, PROBE_SIZE_STATUS, retries=retries)
     if resp:
         ct = resp.headers.get("Content-Type", "")
         if "json" in ct.lower():
@@ -576,21 +594,22 @@ def _run_probes_parallel(
     base_url: str,
     session: requests.Session,
     probe_timeout: float,
+    retries: int = 0,
 ) -> list[Signal]:
     tasks = {
-        "misc_drupal_js":      lambda: probe_misc_drupal_js(session, base_url, probe_timeout),
-        "core_drupal_js":      lambda: probe_core_drupal_js(session, base_url, probe_timeout),
-        "changelog":           lambda: probe_changelog(session, base_url, probe_timeout),
-        "core_changelog":      lambda: probe_core_changelog(session, base_url, probe_timeout),
-        "sites_default_files": lambda: probe_sites_default_files(session, base_url, probe_timeout),
-        "user_login":          lambda: probe_user_login(session, base_url, probe_timeout),
-        "robots_txt":          lambda: probe_robots_txt(session, base_url, probe_timeout),
-        "jsonapi":             lambda: probe_jsonapi(session, base_url, probe_timeout),
+        "misc_drupal_js":      lambda: probe_misc_drupal_js(session, base_url, probe_timeout, retries),
+        "core_drupal_js":      lambda: probe_core_drupal_js(session, base_url, probe_timeout, retries),
+        "changelog":           lambda: probe_changelog(session, base_url, probe_timeout, retries),
+        "core_changelog":      lambda: probe_core_changelog(session, base_url, probe_timeout, retries),
+        "sites_default_files": lambda: probe_sites_default_files(session, base_url, probe_timeout, retries),
+        "user_login":          lambda: probe_user_login(session, base_url, probe_timeout, retries),
+        "robots_txt":          lambda: probe_robots_txt(session, base_url, probe_timeout, retries),
+        "jsonapi":             lambda: probe_jsonapi(session, base_url, probe_timeout, retries),
     }
 
     # All probes hit the same host as each other (safe to share `session`
     # concurrently) and every one of them is bounded by probe_timeout plus a
-    # capped retry backoff (see make_session) — so a plain wait-for-all here
+    # capped retry backoff (see fetch()) — so a plain wait-for-all here
     # can't hang, unlike the old hard_limit/abandon-thread approach.
     signals: list[Signal] = []
     with ThreadPoolExecutor(max_workers=len(tasks)) as ex:
@@ -749,7 +768,7 @@ def detect_drupal(raw_url: str, session: requests.Session, cfg: DetectConfig) ->
         return DrupalResult(url=raw_url, error=err)
 
     # Fetch homepage
-    resp, err = fetch(session, url + "/", cfg.timeout, DEFAULT_MAX_SIZE)
+    resp, text, err = fetch(session, url + "/", cfg.timeout, DEFAULT_MAX_SIZE, retries=cfg.retries)
     if err:
         return DrupalResult(url=raw_url, error=err)
 
@@ -759,7 +778,7 @@ def detect_drupal(raw_url: str, session: requests.Session, cfg: DetectConfig) ->
         dprint(f"Redirected to: {final_base}")
 
     # WAF/CDN detection — explains missing signals without being a hard error
-    block_hint = detect_block(resp)
+    block_hint = detect_block(resp, text)
     if block_hint:
         dprint(f"WAF/CDN detected: {block_hint}")
 
@@ -768,15 +787,15 @@ def detect_drupal(raw_url: str, session: requests.Session, cfg: DetectConfig) ->
     if block_hint and cfg.browser_fallback:
         dprint("Browser fallback triggered")
         if browser_cf_bypass(final_base + "/", session):
-            resp, err = fetch(session, final_base + "/", cfg.timeout, DEFAULT_MAX_SIZE)
+            resp, text, err = fetch(session, final_base + "/", cfg.timeout, DEFAULT_MAX_SIZE, retries=cfg.retries)
             if err:
                 return DrupalResult(url=raw_url, error=err)
-            block_hint = detect_block(resp)
+            block_hint = detect_block(resp, text)
             dprint(f"Post-bypass block status: {block_hint or 'none'}")
 
     signals: list[Signal] = []
     header_sigs = analyze_headers(resp)
-    html_sigs = analyze_html(resp.text or "", source="homepage_html")
+    html_sigs = analyze_html(text, source="homepage_html")
     signals.extend(header_sigs)
     signals.extend(html_sigs)
     dprint(f"Homepage signals ({len(signals)}): "
@@ -785,7 +804,7 @@ def detect_drupal(raw_url: str, session: requests.Session, cfg: DetectConfig) ->
     # Run probes unless fast mode (probes inform both detection AND version)
     if not cfg.fast:
         dprint("Running probes in parallel...")
-        probe_signals = _run_probes_parallel(final_base, session, cfg.probe_timeout)
+        probe_signals = _run_probes_parallel(final_base, session, cfg.probe_timeout, cfg.retries)
         signals.extend(probe_signals)
         dprint(f"Probe signals ({len(probe_signals)}): "
                f"{[s.name for s in probe_signals] if probe_signals else 'none'}")
@@ -822,7 +841,7 @@ def detect_drupal(raw_url: str, session: requests.Session, cfg: DetectConfig) ->
         # If still unknown, try jquery probe (only if not fast)
         if v is None and not cfg.fast:
             dprint("Phase 3a inconclusive — probing /misc/jquery.js")
-            jq = probe_jquery_js(session, final_base, cfg.probe_timeout)
+            jq = probe_jquery_js(session, final_base, cfg.probe_timeout, cfg.retries)
             if jq:
                 dprint(f"jQuery probe: {jq.value}")
                 signals.append(jq)
