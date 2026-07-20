@@ -56,6 +56,8 @@ row order.
 
 ## Code layout
 
+**Code repository:** [gitlab:isDrupal](ssh://git@gitlab.gailabs.com:2232/sc/isdrupal.git)
+
 The detection engine lives in the `isdrupal/` package and is shared by both
 front-ends, so the CLI and the web app run identical logic:
 
