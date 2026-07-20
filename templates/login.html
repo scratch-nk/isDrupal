@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>isDrupal — Sign in</title>
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: grid; place-items: center;
+      font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: #f4f5f7; color: #1a1a1a;
+    }
+    @media (prefers-color-scheme: dark) {
+      body { background: #16181d; color: #e8e8e8; }
+      .card { background: #21242b !important; box-shadow: none !important; }
+      input { background: #16181d; color: #e8e8e8; border-color: #3a3f48 !important; }
+    }
+    .card {
+      background: #fff; padding: 2rem; border-radius: 12px; width: min(92vw, 360px);
+      box-shadow: 0 6px 24px rgba(0,0,0,.08);
+    }
+    h1 { margin: 0 0 .25rem; font-size: 1.3rem; }
+    p.sub { margin: 0 0 1.25rem; color: #777; font-size: .9rem; }
+    label { display: block; font-weight: 600; margin-bottom: .4rem; }
+    input {
+      width: 100%; padding: .65rem .75rem; border: 1px solid #ccc; border-radius: 8px;
+      font-size: 1rem;
+    }
+    button {
+      margin-top: 1rem; width: 100%; padding: .7rem; border: 0; border-radius: 8px;
+      background: #2b6cb0; color: #fff; font-size: 1rem; font-weight: 600; cursor: pointer;
+    }
+    button:hover { background: #2559a0; }
+    .error { margin-top: 1rem; color: #c53030; font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <form class="card" method="post" action="{{ url_for('do_login') }}{% if request.args.get('next') %}?next={{ request.args.get('next') }}{% endif %}">
+    <h1>isDrupal</h1>
+    <p class="sub">Enter the access password to continue.</p>
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autofocus autocomplete="current-password">
+    <button type="submit">Sign in</button>
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  </form>
+</body>
+</html>

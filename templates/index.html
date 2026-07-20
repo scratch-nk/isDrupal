@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>isDrupal — Drupal site detector</title>
+  <style>
+    :root { color-scheme: light dark; --bd:#e2e4e8; --mut:#6b7280; --accent:#2b6cb0; --card:#fff; --bg:#f4f5f7; --fg:#1a1a1a; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bd:#333844; --mut:#9aa0ac; --accent:#4c8fd6; --card:#21242b; --bg:#16181d; --fg:#e8e8e8; }
+    }
+    * { box-sizing: border-box; }
+    body { margin:0; font:15px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--fg); }
+    header { display:flex; align-items:center; justify-content:space-between; padding:1rem 1.5rem; border-bottom:1px solid var(--bd); }
+    header h1 { font-size:1.2rem; margin:0; }
+    header form { margin:0; }
+    .link-btn { background:none; border:0; color:var(--mut); cursor:pointer; font-size:.9rem; }
+    main { max-width:900px; margin:0 auto; padding:1.5rem; }
+    .tabs { display:flex; gap:.5rem; margin-bottom:1rem; }
+    .tab { padding:.5rem 1rem; border:1px solid var(--bd); border-radius:8px; background:var(--card); cursor:pointer; font-weight:600; color:var(--fg); }
+    .tab.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+    .panel { display:none; background:var(--card); border:1px solid var(--bd); border-radius:12px; padding:1.25rem; }
+    .panel.active { display:block; }
+    label.fld { display:block; font-weight:600; margin-bottom:.4rem; }
+    input[type=text], input[type=file] { width:100%; padding:.6rem .7rem; border:1px solid var(--bd); border-radius:8px; background:var(--bg); color:var(--fg); font-size:1rem; }
+    .opts { display:flex; gap:1.25rem; margin:1rem 0; flex-wrap:wrap; }
+    .opts label { display:flex; align-items:center; gap:.4rem; font-size:.92rem; cursor:pointer; }
+    button.go { padding:.65rem 1.3rem; border:0; border-radius:8px; background:var(--accent); color:#fff; font-weight:600; font-size:1rem; cursor:pointer; }
+    button.go:disabled { opacity:.55; cursor:default; }
+    .hint { color:var(--mut); font-size:.85rem; margin-top:.5rem; }
+    /* result card */
+    #result { margin-top:1.25rem; }
+    .card { background:var(--card); border:1px solid var(--bd); border-radius:12px; padding:1.1rem 1.25rem; }
+    .badge { display:inline-block; padding:.2rem .6rem; border-radius:999px; font-size:.8rem; font-weight:700; }
+    .b-yes { background:#2f855a; color:#fff; } .b-no { background:#718096; color:#fff; }
+    .b-unknown { background:#b7791f; color:#fff; } .b-err { background:#c53030; color:#fff; }
+    .kv { margin:.6rem 0 0; display:grid; grid-template-columns:auto 1fr; gap:.25rem 1rem; font-size:.92rem; }
+    .kv dt { color:var(--mut); } .kv dd { margin:0; }
+    .sig { display:inline-block; background:var(--bg); border:1px solid var(--bd); border-radius:6px; padding:.05rem .4rem; margin:.15rem .2rem 0 0; font-size:.8rem; font-family:ui-monospace,monospace; }
+    /* progress + table */
+    .barwrap { height:12px; background:var(--bg); border:1px solid var(--bd); border-radius:999px; overflow:hidden; margin:1rem 0 .5rem; }
+    .bar { height:100%; width:0; background:var(--accent); transition:width .3s; }
+    .tablewrap { overflow-x:auto; margin-top:1rem; }
+    table { border-collapse:collapse; width:100%; font-size:.88rem; }
+    th, td { text-align:left; padding:.4rem .6rem; border-bottom:1px solid var(--bd); white-space:nowrap; }
+    th { position:sticky; top:0; background:var(--card); }
+    td.res { font-weight:600; }
+    .err { color:#c53030; margin-top:.75rem; }
+    a.dl { display:inline-block; margin-top:1rem; padding:.55rem 1rem; background:#2f855a; color:#fff; border-radius:8px; text-decoration:none; font-weight:600; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>isDrupal</h1>
+    <form method="post" action="{{ url_for('logout') }}"><button class="link-btn" type="submit">Sign out</button></form>
+  </header>
+  <main>
+    <div class="tabs">
+      <div class="tab active" data-tab="url">Single URL</div>
+      <div class="tab" data-tab="csv">CSV upload</div>
+    </div>
+
+    <!-- Single URL -->
+    <section class="panel active" id="panel-url">
+      <label class="fld" for="url">Website URL</label>
+      <input type="text" id="url" placeholder="example.com" autocomplete="off">
+      <div class="opts">
+        <label><input type="checkbox" class="opt-fast"> Fast (homepage only)</label>
+        <label><input type="checkbox" class="opt-drupalonly"> Drupal only (skip version)</label>
+      </div>
+      <button class="go" id="check-btn">Check</button>
+      <div id="result"></div>
+    </section>
+
+    <!-- CSV -->
+    <section class="panel" id="panel-csv">
+      <label class="fld" for="file">CSV file</label>
+      <input type="file" id="file" accept=".csv,text/csv">
+      <div class="hint">The file must include a <code>domain</code> column. Other columns are preserved in the output.</div>
+      <div class="opts">
+        <label><input type="checkbox" class="opt-fast"> Fast (homepage only)</label>
+        <label><input type="checkbox" class="opt-drupalonly"> Drupal only (skip version)</label>
+      </div>
+      <button class="go" id="upload-btn">Upload &amp; check</button>
+      <div id="csv-status" style="display:none">
+        <div class="barwrap"><div class="bar" id="bar"></div></div>
+        <div id="counter" class="hint"></div>
+        <a class="dl" id="download" style="display:none">Download results CSV</a>
+        <div class="tablewrap"><table id="results-table"><thead></thead><tbody></tbody></table></div>
+      </div>
+      <div class="err" id="csv-error"></div>
+    </section>
+  </main>
+
+<script>
+const $ = (s, r=document) => r.querySelector(s);
+
+// tab switching
+document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
+  document.querySelectorAll('.tab').forEach(x => x.classList.toggle('active', x===t));
+  document.querySelectorAll('.panel').forEach(p => p.classList.toggle('active', p.id === 'panel-'+t.dataset.tab));
+});
+
+function opts(panelId) {
+  const p = $('#'+panelId);
+  return { fast: $('.opt-fast', p).checked, drupal_only: $('.opt-drupalonly', p).checked };
+}
+function badgeFor(r) {
+  if (r.error) return ['b-err','Error'];
+  if (r.is_drupal === true) return ['b-yes', r.version ? 'Drupal '+r.version : 'Drupal'];
+  if (r.is_drupal === false) return ['b-no','Not Drupal'];
+  return ['b-unknown','Unknown'];
+}
+function esc(s){ return String(s ?? '').replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+// ── Single URL ────────────────────────────────────────────────────────────────
+$('#check-btn').onclick = async () => {
+  const url = $('#url').value.trim();
+  const out = $('#result');
+  if (!url) { out.innerHTML = '<div class="card err">Please enter a URL.</div>'; return; }
+  const btn = $('#check-btn'); btn.disabled = true; btn.textContent = 'Checking…';
+  out.innerHTML = '';
+  try {
+    const res = await fetch('{{ url_for("api_check") }}', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({url, ...opts('panel-url')})
+    });
+    const r = await res.json();
+    if (!res.ok) { out.innerHTML = `<div class="card err">${esc(r.error||'Request failed')}</div>`; return; }
+    const [cls,label] = badgeFor(r);
+    let sigs = (r.signals||[]).map(s => `<span class="sig">${esc(s)}</span>`).join('');
+    out.innerHTML = `<div class="card">
+      <span class="badge ${cls}">${esc(label)}</span>
+      <dl class="kv">
+        <dt>URL</dt><dd>${esc(r.url)}</dd>
+        <dt>Confidence</dt><dd>${esc(r.confidence)}</dd>
+        ${r.version ? `<dt>Version</dt><dd>${esc(r.version)}</dd>`:''}
+        ${r.block_hint ? `<dt>WAF/CDN</dt><dd>${esc(r.block_hint)}</dd>`:''}
+        ${r.error ? `<dt>Error</dt><dd>${esc(r.error)}</dd>`:''}
+      </dl>
+      ${sigs ? `<div style="margin-top:.6rem">${sigs}</div>`:''}
+    </div>`;
+  } catch(e) {
+    out.innerHTML = `<div class="card err">${esc(e.message)}</div>`;
+  } finally { btn.disabled = false; btn.textContent = 'Check'; }
+};
+$('#url').addEventListener('keydown', e => { if (e.key==='Enter') $('#check-btn').click(); });
+
+// ── CSV ───────────────────────────────────────────────────────────────────────
+let pollTimer = null;
+$('#upload-btn').onclick = async () => {
+  const f = $('#file').files[0];
+  const errBox = $('#csv-error'); errBox.textContent = '';
+  if (!f) { errBox.textContent = 'Please choose a CSV file.'; return; }
+  const btn = $('#upload-btn'); btn.disabled = true; btn.textContent = 'Uploading…';
+  if (pollTimer) clearInterval(pollTimer);
+
+  const fd = new FormData();
+  fd.append('file', f);
+  const o = opts('panel-csv');
+  fd.append('fast', o.fast); fd.append('drupal_only', o.drupal_only);
+
+  try {
+    const res = await fetch('{{ url_for("api_check_csv") }}', { method:'POST', body: fd });
+    const r = await res.json();
+    if (!res.ok) { errBox.textContent = r.error || 'Upload failed'; return; }
+    startJob(r.job_id, r.total);
+  } catch(e) { errBox.textContent = e.message; }
+  finally { btn.disabled = false; btn.textContent = 'Upload & check'; }
+};
+
+function startJob(jobId, total) {
+  $('#csv-status').style.display = 'block';
+  $('#download').style.display = 'none';
+  const thead = $('#results-table thead'); const tbody = $('#results-table tbody');
+  thead.innerHTML = ''; tbody.innerHTML = '';
+  let headerDrawn = false, cursor = 0;
+
+  const tick = async () => {
+    const res = await fetch(`/api/status/${jobId}?cursor=${cursor}`);
+    if (!res.ok) { clearInterval(pollTimer); $('#csv-error').textContent = 'Lost the job.'; return; }
+    const s = await res.json();
+    cursor = s.cursor;
+    const pct = s.total ? Math.round(100*s.done/s.total) : 0;
+    $('#bar').style.width = pct + '%';
+    $('#counter').textContent = `${s.done} / ${s.total} checked (${pct}%)`;
+
+    for (const row of s.new_rows) {
+      if (!headerDrawn) {
+        const cols = ['drupal_result', ...Object.keys(row).filter(k => k!=='drupal_result')];
+        thead.innerHTML = '<tr>' + cols.map(c=>`<th>${esc(c)}</th>`).join('') + '</tr>';
+        thead.dataset.cols = JSON.stringify(cols);
+        headerDrawn = true;
+      }
+      const cols = JSON.parse(thead.dataset.cols);
+      tbody.insertAdjacentHTML('beforeend',
+        '<tr>' + cols.map(c => `<td class="${c==='drupal_result'?'res':''}">${esc(row[c])}</td>`).join('') + '</tr>');
+    }
+
+    if (s.status === 'done' || s.status === 'error') {
+      clearInterval(pollTimer); pollTimer = null;
+      if (s.status === 'error') $('#csv-error').textContent = 'Job failed: ' + (s.error||'unknown');
+      const dl = $('#download'); dl.href = `/api/download/${jobId}`; dl.style.display = 'inline-block';
+    }
+  };
+  tick();
+  pollTimer = setInterval(tick, 3000);   // poll every 3s
+}
+</script>
+</body>
+</html>
