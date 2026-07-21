@@ -39,3 +39,9 @@ class DetectConfig:
     proxy:           str | None = None
     browser_fallback: bool = False   # open Chromium on WAF block (CLI only)
     verbose:         bool  = False   # include matched signals in format_result
+
+    # Not read by anything yet — isdrupal.core/isdrupal.batch/app.py don't consult
+    # these in this pass. Wiring is deferred: log_file will feed isdrupal.log.get_logger(),
+    # output_file will feed the batch/CSV write path.
+    log_file:        str | None = None   # if set, isdrupal.log writes here (see log.py)
+    output_file:     str | None = None   # if set, write full per-domain results here
