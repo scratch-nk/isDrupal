@@ -41,7 +41,7 @@ def run_batch(
     """
     logger = get_logger(cfg.log_file) if cfg.log_file else None
     if logger:
-        logger.info("batch start: %d domains, %d workers", len(domains), workers)
+        logger.info("batch start: %s:%d domains, %d workers", cfg.log_file, len(domains), workers)
 
     row_iter = enumerate(domains)
     pending: dict[int, tuple[str, DrupalResult]] = {}
