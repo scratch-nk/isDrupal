@@ -51,6 +51,7 @@ def _config_from_args(args: argparse.Namespace) -> DetectConfig:
         proxy=args.proxy,
         browser_fallback=args.browser_fallback,
         verbose=args.verbose,
+        log_file=args.log_file,
     )
 
 
@@ -153,6 +154,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-v", "--verbose", action="store_true",
         help="Also print the signal(s) that led to the result (e.g. sites_default_files, meta_generator)",
+    )
+    parser.add_argument(
+        "--log-file", metavar="FILE",
+        help="Write a per-check log line to FILE (rotating). Unset: logging stays off.",
     )
     parser.add_argument(
         "--browser-fallback", action="store_true",

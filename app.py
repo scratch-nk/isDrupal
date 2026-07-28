@@ -48,6 +48,9 @@ APP_PASSWORD = os.environ.get("ISDRUPAL_PASSWORD")
 
 BATCH_WORKERS = int(os.environ.get("ISDRUPAL_WORKERS", "10"))
 
+# Optional — unset means logging stays off (see isdrupal.log.get_logger).
+LOG_FILE = os.environ.get("ISDRUPAL_LOG_FILE")
+
 # In-memory job registry. Requires a SINGLE gunicorn worker (jobs are not shared
 # across processes and do not survive a restart). See isdrupal.security for the
 # opt-in Redis path if you outgrow this.
@@ -101,7 +104,7 @@ def _make_config(fast: bool, drupal_only: bool) -> DetectConfig:
     # Excluded-from-UI options stay at their safe defaults (no browser fallback,
     # verify SSL, no proxy). Signals are always surfaced, so verbose stays off
     # here and we read result.signals_found directly.
-    return DetectConfig(fast=fast, drupal_only=drupal_only)
+    return DetectConfig(fast=fast, drupal_only=drupal_only, log_file=LOG_FILE)
 
 
 def _result_payload(result, drupal_only: bool) -> dict:

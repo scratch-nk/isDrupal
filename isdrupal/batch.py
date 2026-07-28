@@ -13,6 +13,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as cf_w
 
 from .config import DetectConfig
 from .core import DrupalResult, detect_drupal, make_session
+from .log import get_logger
 
 
 def _check_one(domain: str, cfg: DetectConfig) -> DrupalResult:
@@ -38,6 +39,10 @@ def run_batch(
     of how many domains there are. Completions can arrive out of order, so they
     are buffered in `pending` just long enough to emit in the original order.
     """
+    logger = get_logger(cfg.log_file) if cfg.log_file else None
+    if logger:
+        logger.info("batch start: %d domains, %d workers", len(domains), workers)
+
     row_iter = enumerate(domains)
     pending: dict[int, tuple[str, DrupalResult]] = {}
     next_idx = 0
@@ -73,3 +78,6 @@ def run_batch(
                     next_idx += 1
 
                 submit_next()
+
+    if logger:
+        logger.info("batch done: %d domains processed", next_idx)

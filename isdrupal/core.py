@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 from .config import DetectConfig
+from .log import get_logger
 
 # Must be registered before importing requests — the warning fires at import time
 warnings.filterwarnings("ignore", message=r"urllib3 \(")
@@ -85,6 +86,16 @@ def set_debug(enabled: bool) -> None:
 def dprint(msg: str) -> None:
     if _debug:
         print(f"[debug] {msg}", file=sys.stderr)
+
+
+def _log_result(logger, result: "DrupalResult") -> None:
+    if logger is None:
+        return
+    logger.info(
+        "url=%s is_drupal=%s confidence=%s version=%s block_hint=%s error=%s",
+        result.url, result.is_drupal, result.confidence, result.drupal_version,
+        result.block_hint, result.error,
+    )
 
 
 # ─── Section 3: Data Structures ──────────────────────────────────────────────
@@ -759,18 +770,23 @@ def determine_version(era: str | None, phase3: str | None, signals: list[Signal]
 # ─── Section 10: Orchestrator ─────────────────────────────────────────────────
 
 def detect_drupal(raw_url: str, session: requests.Session, cfg: DetectConfig) -> DrupalResult:
+    logger = get_logger(cfg.log_file) if cfg.log_file else None
     url = normalize_url(raw_url)
     dprint(f"URL: {url}")
 
     valid, err = validate_url(url)
     if not valid:
         dprint(f"Validation failed: {err}")
-        return DrupalResult(url=raw_url, error=err)
+        result = DrupalResult(url=raw_url, error=err)
+        _log_result(logger, result)
+        return result
 
     # Fetch homepage
     resp, text, err = fetch(session, url + "/", cfg.timeout, DEFAULT_MAX_SIZE, retries=cfg.retries)
     if err:
-        return DrupalResult(url=raw_url, error=err)
+        result = DrupalResult(url=raw_url, error=err)
+        _log_result(logger, result)
+        return result
 
     # Use post-redirect URL as canonical base for all probes
     final_base = extract_base(resp.url)
@@ -789,7 +805,9 @@ def detect_drupal(raw_url: str, session: requests.Session, cfg: DetectConfig) ->
         if browser_cf_bypass(final_base + "/", session):
             resp, text, err = fetch(session, final_base + "/", cfg.timeout, DEFAULT_MAX_SIZE, retries=cfg.retries)
             if err:
-                return DrupalResult(url=raw_url, error=err)
+                result = DrupalResult(url=raw_url, error=err)
+                _log_result(logger, result)
+                return result
             block_hint = detect_block(resp, text)
             dprint(f"Post-bypass block status: {block_hint or 'none'}")
 
@@ -815,22 +833,26 @@ def detect_drupal(raw_url: str, session: requests.Session, cfg: DetectConfig) ->
     dprint(f"Phase 1: is_drupal={is_drupal}, confidence={confidence}")
 
     if cfg.drupal_only:
-        return DrupalResult(
+        result = DrupalResult(
             url=raw_url,
             is_drupal=is_drupal,
             confidence=confidence,
             signals_found=[s.name for s in signals],
             block_hint=block_hint,
         )
+        _log_result(logger, result)
+        return result
 
     if is_drupal is not True:
-        return DrupalResult(
+        result = DrupalResult(
             url=raw_url,
             is_drupal=is_drupal,
             confidence=confidence,
             signals_found=[s.name for s in signals],
             block_hint=block_hint,
         )
+        _log_result(logger, result)
+        return result
 
     era = run_phase2(signals)
     dprint(f"Phase 2 era: {era}")
@@ -856,7 +878,7 @@ def detect_drupal(raw_url: str, session: requests.Session, cfg: DetectConfig) ->
     drupal_version = determine_version(era, v, signals)
     dprint(f"Final version: {drupal_version}")
 
-    return DrupalResult(
+    result = DrupalResult(
         url=raw_url,
         is_drupal=True,
         confidence=confidence,
@@ -864,6 +886,8 @@ def detect_drupal(raw_url: str, session: requests.Session, cfg: DetectConfig) ->
         signals_found=[s.name for s in _deduplicate(signals)],
         block_hint=block_hint,
     )
+    _log_result(logger, result)
+    return result
 
 
 # ─── Section 11: Output Formatter ────────────────────────────────────────────
