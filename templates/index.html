@@ -67,6 +67,7 @@
       <div class="opts">
         <label><input type="checkbox" class="opt-fast"> Fast (homepage only)</label>
         <label><input type="checkbox" class="opt-drupalonly"> Drupal only (skip version)</label>
+        <label><input type="checkbox" class="opt-checksimplicity"> Check migration simplicity if Drupal 6/7</label>
       </div>
       <button class="go" id="check-btn">Check</button>
       <div id="result"></div>
@@ -80,6 +81,7 @@
       <div class="opts">
         <label><input type="checkbox" class="opt-fast"> Fast (homepage only)</label>
         <label><input type="checkbox" class="opt-drupalonly"> Drupal only (skip version)</label>
+        <label><input type="checkbox" class="opt-checksimplicity"> Check migration simplicity (Drupal 6/7 rows; adds latency)</label>
       </div>
       <button class="go" id="upload-btn">Upload &amp; check</button>
       <div id="csv-status" style="display:none">
@@ -103,7 +105,11 @@ document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
 
 function opts(panelId) {
   const p = $('#'+panelId);
-  return { fast: $('.opt-fast', p).checked, drupal_only: $('.opt-drupalonly', p).checked };
+  return {
+    fast: $('.opt-fast', p).checked,
+    drupal_only: $('.opt-drupalonly', p).checked,
+    check_simplicity: $('.opt-checksimplicity', p).checked,
+  };
 }
 function badgeFor(r) {
   if (r.error) return ['b-err','Error'];
@@ -129,6 +135,19 @@ $('#check-btn').onclick = async () => {
     if (!res.ok) { out.innerHTML = `<div class="card err">${esc(r.error||'Request failed')}</div>`; return; }
     const [cls,label] = badgeFor(r);
     let sigs = (r.signals||[]).map(s => `<span class="sig">${esc(s)}</span>`).join('');
+    let simplicityBlock = '';
+    if (r.simplicity_score != null) {
+      simplicityBlock = `<dl class="kv" style="margin-top:.85rem; padding-top:.75rem; border-top:1px solid var(--bd)">
+        <dt>Migration simplicity</dt><dd>${esc(r.simplicity_verdict)} (${r.simplicity_score}/100)</dd>
+        <dt>Pages (groups)</dt><dd>${r.simplicity_page_count} (${r.simplicity_raw_url_count} URLs discovered)</dd>
+        <dt>Content types</dt><dd>${esc((r.simplicity_content_types||[]).join(', ')) || 'none detected'}</dd>
+        ${(r.simplicity_custom_modules||[]).length ? `<dt>Custom modules</dt><dd>${esc(r.simplicity_custom_modules.join(', '))}</dd>`:''}
+        ${(r.simplicity_custom_themes||[]).length ? `<dt>Custom theme</dt><dd>${esc(r.simplicity_custom_themes.join(', '))}</dd>`:''}
+        ${(r.simplicity_features||[]).length ? `<dt>Other features</dt><dd>${esc(r.simplicity_features.join(', '))}</dd>`:''}
+      </dl>`;
+    } else if (r.simplicity_error) {
+      simplicityBlock = `<div class="err" style="margin-top:.75rem">Simplicity check error: ${esc(r.simplicity_error)}</div>`;
+    }
     out.innerHTML = `<div class="card">
       <span class="badge ${cls}">${esc(label)}</span>
       <dl class="kv">
@@ -139,6 +158,7 @@ $('#check-btn').onclick = async () => {
         ${r.error ? `<dt>Error</dt><dd>${esc(r.error)}</dd>`:''}
       </dl>
       ${sigs ? `<div style="margin-top:.6rem">${sigs}</div>`:''}
+      ${simplicityBlock}
     </div>`;
   } catch(e) {
     out.innerHTML = `<div class="card err">${esc(e.message)}</div>`;
@@ -159,6 +179,7 @@ $('#upload-btn').onclick = async () => {
   fd.append('file', f);
   const o = opts('panel-csv');
   fd.append('fast', o.fast); fd.append('drupal_only', o.drupal_only);
+  fd.append('check_simplicity', o.check_simplicity);
 
   try {
     const res = await fetch('{{ url_for("api_check_csv") }}', { method:'POST', body: fd });

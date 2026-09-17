@@ -117,6 +117,10 @@ class DrupalResult:
     signals_found:  list[str] = field(default_factory=list)
     block_hint:     str | None = None   # WAF/CDN identified in the response
     error:          str | None = None
+    # isdrupal.small_site.SimplicityReport, set post-hoc by batch.py/app.py/CLI
+    # when --check-simplicity is requested and this result is confirmed D6/7.
+    # Kept untyped here so core.py needn't import small_site.py (avoids a cycle).
+    simplicity:     object | None = None
 
 
 # ─── Section 4: URL Utilities ─────────────────────────────────────────────────

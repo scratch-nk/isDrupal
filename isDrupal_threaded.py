@@ -76,17 +76,35 @@ def process_csv(args: argparse.Namespace, cfg: DetectConfig) -> None:
     domains = [(r.get(args.domain_col) or "").strip() for r in rows]
     total = len(rows)
 
+    simplicity_kwargs = None
+    # Original columns first, then our added columns — keeps the source data
+    # immediately visible instead of buried after two dozen result columns.
+    out_fieldnames = list(fieldnames) + ["drupal_result"]
+    if args.check_simplicity:
+        from isdrupal.small_site import SIMPLICITY_CSV_FIELDNAMES, simplicity_csv_row
+        out_fieldnames += SIMPLICITY_CSV_FIELDNAMES
+        simplicity_kwargs = {
+            "pages_per_group": args.simplicity_pages_per_group,
+            "max_pages_total": args.simplicity_max_pages,
+        }
+
     with open(output_path, "w", newline="", encoding="utf-8") as out_f:
-        writer = csv.DictWriter(out_f, fieldnames=["drupal_result"] + fieldnames)
+        writer = csv.DictWriter(out_f, fieldnames=out_fieldnames)
         writer.writeheader()
 
         progress = _tqdm(total=total, unit="url") if TQDM_AVAILABLE else None
         done = 0
 
         # run_batch yields in input order, so we can write straight through.
-        for idx, _domain, result in run_batch(domains, cfg, workers=args.workers):
+        for idx, _domain, result in run_batch(
+            domains, cfg, workers=args.workers,
+            check_simplicity=args.check_simplicity, simplicity_kwargs=simplicity_kwargs,
+        ):
             drupal_result = format_result(result, drupal_only=args.drupal_only, verbose=args.verbose)
-            writer.writerow({"drupal_result": drupal_result, **rows[idx]})
+            out_row = {**rows[idx], "drupal_result": drupal_result}
+            if args.check_simplicity:
+                out_row.update(simplicity_csv_row(result.simplicity))
+            writer.writerow(out_row)
             out_f.flush()
             done += 1
             if progress is not None:
@@ -115,6 +133,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  %(prog)s --fast https://example.com\n"
             "  %(prog)s --drupal-only https://example.com\n"
             "  %(prog)s -i domains.csv -w 20\n"
+            "  %(prog)s https://example.com --check-simplicity -v\n"
         ),
     )
     parser.add_argument("url", metavar="URL", nargs="?", help="Target URL to check")
@@ -186,6 +205,23 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Retries on transient errors (default: {DEFAULT_RETRIES})",
     )
 
+    simplicity = parser.add_argument_group("Migration simplicity (Drupal 6/7 only)")
+    simplicity.add_argument(
+        "--check-simplicity", action="store_true",
+        help=(
+            "After confirming Drupal 6/7, crawl the site and estimate migration simplicity "
+            "(adds latency; works in both single-URL and -i/--input CSV mode)"
+        ),
+    )
+    simplicity.add_argument(
+        "--simplicity-pages-per-group", type=int, default=3, metavar="N",
+        help="Representative pages sampled per URL group (default: 3)",
+    )
+    simplicity.add_argument(
+        "--simplicity-max-pages", type=int, default=60, metavar="N",
+        help="Hard cap on total pages fetched for simplicity analysis (default: 60)",
+    )
+
     return parser
 
 
@@ -203,6 +239,8 @@ def main() -> None:
         parser.error("--retries must be >= 0")
     if args.workers < 1:
         parser.error("--workers must be >= 1")
+    if args.check_simplicity and args.drupal_only:
+        parser.error("--check-simplicity requires version detection; drop --drupal-only")
 
     if args.no_verify_ssl:
         import urllib3
@@ -222,6 +260,20 @@ def main() -> None:
         session = make_session(cfg)
         result = detect_drupal(args.url, session, cfg)
         print(format_result(result, drupal_only=args.drupal_only, verbose=args.verbose))
+
+        if args.check_simplicity:
+            from isdrupal.small_site import check_simplicity, format_simplicity_report, is_drupal_6_or_7
+            if result.is_drupal is True and is_drupal_6_or_7(result.drupal_version):
+                report = check_simplicity(
+                    result.url, session, cfg, drupal_version=result.drupal_version,
+                    pages_per_group=args.simplicity_pages_per_group,
+                    max_pages_total=args.simplicity_max_pages,
+                )
+                print()
+                print(format_simplicity_report(report, verbose=args.verbose))
+            elif args.debug:
+                print("[debug] --check-simplicity skipped: not confirmed Drupal 6/7", file=sys.stderr)
+
         if result.error:
             sys.exit(2)
         elif result.is_drupal is True:

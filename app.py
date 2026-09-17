@@ -36,6 +36,7 @@ from flask import (
     session,
     url_for,
 )
+from werkzeug.utils import secure_filename
 
 from isdrupal import DetectConfig, detect_drupal, format_result, make_session, run_batch
 from isdrupal.security import SSRFError, assert_public_url
@@ -108,7 +109,7 @@ def _make_config(fast: bool, drupal_only: bool) -> DetectConfig:
 
 
 def _result_payload(result, drupal_only: bool) -> dict:
-    return {
+    payload = {
         "url": result.url,
         "summary": format_result(result, drupal_only=drupal_only),
         "is_drupal": result.is_drupal,
@@ -117,7 +118,30 @@ def _result_payload(result, drupal_only: bool) -> dict:
         "signals": result.signals_found,
         "block_hint": result.block_hint,
         "error": result.error,
+        "simplicity_score": None,
+        "simplicity_verdict": None,
+        "simplicity_page_count": None,
+        "simplicity_raw_url_count": None,
+        "simplicity_content_types": None,
+        "simplicity_custom_modules": None,
+        "simplicity_custom_themes": None,
+        "simplicity_features": None,
+        "simplicity_error": None,
     }
+    if result.simplicity is not None:
+        report = result.simplicity
+        payload.update({
+            "simplicity_score": report.score,
+            "simplicity_verdict": report.verdict,
+            "simplicity_page_count": report.page_count,
+            "simplicity_raw_url_count": report.raw_url_count,
+            "simplicity_content_types": sorted(report.content_types),
+            "simplicity_custom_modules": sorted(report.custom_modules),
+            "simplicity_custom_themes": sorted(report.custom_themes),
+            "simplicity_features": sorted(report.features),
+            "simplicity_error": report.error,
+        })
+    return payload
 
 
 # ─── Single-URL check ─────────────────────────────────────────────────────────
@@ -138,6 +162,7 @@ def api_check():
 
     fast = _truthy(data.get("fast"))
     drupal_only = _truthy(data.get("drupal_only"))
+    check_simplicity = _truthy(data.get("check_simplicity"))
 
     try:
         assert_public_url(_ensure_scheme(url))
@@ -145,7 +170,17 @@ def api_check():
         return jsonify(error=str(e)), 400
 
     cfg = _make_config(fast, drupal_only)
-    result = detect_drupal(url, make_session(cfg), cfg)
+    session_ = make_session(cfg)
+    result = detect_drupal(url, session_, cfg)
+
+    if check_simplicity and result.is_drupal is True:
+        from isdrupal.small_site import check_simplicity as _check_simplicity
+        from isdrupal.small_site import is_drupal_6_or_7
+        if is_drupal_6_or_7(result.drupal_version):
+            result.simplicity = _check_simplicity(
+                result.url, session_, cfg, drupal_version=result.drupal_version,
+            )
+
     return jsonify(_result_payload(result, drupal_only))
 
 
@@ -160,6 +195,7 @@ def api_check_csv():
 
     fast = _truthy(request.form.get("fast"))
     drupal_only = _truthy(request.form.get("drupal_only"))
+    check_simplicity = _truthy(request.form.get("check_simplicity"))
 
     try:
         raw = file.read().decode("utf-8-sig")
@@ -179,30 +215,51 @@ def api_check_csv():
     if not rows:
         return jsonify(error="CSV has no data rows."), 400
 
+    # secure_filename strips path separators/unsafe characters from the
+    # user-supplied upload name before it's ever echoed back in a response
+    # header (Content-Disposition, in api_download) or used to build a path.
+    orig_filename = secure_filename(file.filename) or "domains.csv"
+
     job_id = uuid.uuid4().hex
     with _jobs_lock:
         _jobs[job_id] = {
             "status": "running",
             "total": len(rows),
             "done": 0,
-            "rows": [],            # list of {**row, drupal_result}
+            "rows": [],            # list of {**row, drupal_result, [simplicity_* columns]}
             "fieldnames": fieldnames,
+            "orig_filename": orig_filename,
             "drupal_only": drupal_only,
+            "check_simplicity": check_simplicity,
             "error": None,
         }
 
     cfg = _make_config(fast, drupal_only)
-    t = threading.Thread(target=_run_job, args=(job_id, rows, cfg, drupal_only), daemon=True)
+    t = threading.Thread(
+        target=_run_job, args=(job_id, rows, cfg, drupal_only, check_simplicity), daemon=True,
+    )
     t.start()
     return jsonify(job_id=job_id, total=len(rows))
 
 
-def _run_job(job_id: str, rows: list[dict], cfg: DetectConfig, drupal_only: bool) -> None:
+def _run_job(
+    job_id: str, rows: list[dict], cfg: DetectConfig, drupal_only: bool, check_simplicity: bool = False,
+) -> None:
     domains = [(r.get("domain") or "").strip() for r in rows]
+    simplicity_row_fn = None
+    if check_simplicity:
+        from isdrupal.small_site import simplicity_csv_row
+        simplicity_row_fn = simplicity_csv_row
     try:
-        for idx, _domain, result in run_batch(domains, cfg, workers=BATCH_WORKERS):
+        for idx, _domain, result in run_batch(
+            domains, cfg, workers=BATCH_WORKERS,
+            check_simplicity=check_simplicity,
+            simplicity_kwargs={"max_pages_total": 30} if check_simplicity else None,
+        ):
             summary = format_result(result, drupal_only=drupal_only)
             out_row = {**rows[idx], "drupal_result": summary}
+            if simplicity_row_fn is not None:
+                out_row.update(simplicity_row_fn(result.simplicity))
             with _jobs_lock:
                 job = _jobs.get(job_id)
                 if job is None:
@@ -245,18 +302,29 @@ def api_download(job_id: str):
         job = _jobs.get(job_id)
         if job is None:
             abort(404)
-        fieldnames = ["drupal_result"] + job["fieldnames"]
+        # Original columns first, then our added columns — keeps the source
+        # data immediately visible instead of buried after two dozen result
+        # columns (matches isDrupal_threaded.py's process_csv ordering).
+        fieldnames = list(job["fieldnames"]) + ["drupal_result"]
+        if job.get("check_simplicity"):
+            from isdrupal.small_site import SIMPLICITY_CSV_FIELDNAMES
+            fieldnames += SIMPLICITY_CSV_FIELDNAMES
         rows = list(job["rows"])
+        orig_filename = job.get("orig_filename") or "domains.csv"
 
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
     writer.writeheader()
     for row in rows:
         writer.writerow(row)
+
+    # Mirror the CLI's <input>_output.csv naming instead of an opaque job-id name.
+    base, ext = os.path.splitext(orig_filename)
+    download_name = f"{base}_output{ext or '.csv'}"
     return Response(
         buf.getvalue(),
         mimetype="text/csv",
-        headers={"Content-Disposition": f"attachment; filename=drupal_results_{job_id[:8]}.csv"},
+        headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
     )
 
 

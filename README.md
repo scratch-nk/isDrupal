@@ -225,6 +225,140 @@ Stop probing as soon as Phase 1 returns *not Drupal* or a *definitive* signal is
 
 ---
 
+## Simplicity Detection (migration to newer Drupal)
+
+Once a site is confirmed **Drupal 6 or 7**, `--check-simplicity` (CLI, works
+in both single-URL and `-i`/CSV batch mode) or the "Check migration
+simplicity" checkbox (web app, single-URL and CSV panels) runs a lightweight
+crawl to estimate how much work migrating it to a modern Drupal (9/10/11)
+would be. This is deliberately a *rough estimate*, not a migration audit —
+implemented in `isdrupal/small_site.py`, strictly additive on top of the
+detection engine above (nothing here changes `detect_drupal`'s behavior).
+
+### Step 1 — URL discovery
+
+1. Fetch `/robots.txt`; look for one or more `Sitemap:` directives.
+2. If found, fetch each sitemap and recurse through `<sitemapindex>` nesting
+   (bounded depth, bounded file count), collecting every `<loc>` in a
+   `<urlset>`.
+3. If no sitemap is found (or it yields nothing), fall back to scanning
+   same-domain `<a href>` links on the homepage.
+4. Dedupe. **Known limitation:** gzip-compressed sitemaps (`.xml.gz`) are not
+   decoded in this release.
+
+### Step 2 — Grouping (the canonical "page count")
+
+URLs are grouped by path pattern so repetitive pages collapse into one group
+— e.g. `/news/article-1`, `/news/article-2` → group `news`. **Page count is
+the number of distinct groups, not the number of raw URLs discovered** — a
+site with 300 URLs but one repeating pattern is a "1-section" site for
+migration purposes, not a 300-page site.
+
+| URL shape | Group |
+|---|---|
+| `/node/123` | `node` |
+| `/taxonomy/term/45` | `taxonomy_term` |
+| `/user/7` | `user` |
+| `/about-us` (single segment) | `page:about-us` |
+| `/news/article-headline` (multi-segment) | `path:news` |
+
+### Step 3 — Sampling: breadth before depth
+
+A small number of representative URLs (default 3 per group) are sampled,
+capped at a total page budget (default 60 for the CLI, 30 for the web app's
+CSV batch mode, since it shares the gunicorn worker pool). Sampling is
+**breadth-first**: every group contributes one URL (the middle URL of its
+list, to avoid bias toward whatever sorted first — e.g. always the newest
+article) before any group contributes a second, so a handful of huge
+sections (500 `/news/` articles) can't crowd out smaller sections and starve
+content-type detection, which is the dominant scoring factor (see Step 5).
+
+### Step 4 — Per-page signals
+
+| Category | Pattern |
+|---|---|
+| Content type | `node-type-X` (D6/7) / `node--type-x` (D8+ BEM) |
+| Taxonomy | `/taxonomy/term/N` referenced in-page |
+| Custom module | `/sites/all/modules/custom/X/` (D6/7) / `/modules/custom/X/` (D8+) |
+| Contrib module | other `/sites/all/modules/X/` or `/modules/X/` paths |
+| Custom theme | `/sites/all/themes/custom/X/` (D6/7) / `/themes/custom/X/` (D8+) |
+| Views | `view-id-X`, `view-display-id-X` classes |
+| Webform / Search / Media / Image styles / Multilingual / Login / Commerce / Open registration | see `isdrupal/small_site.py`'s `_extract_features` |
+
+### Step 5 — Scoring
+
+Starts at 100, deducts weighted points per category, floors at 0:
+
+| Category | Weight | Cap |
+|---|---|---|
+| Content types (beyond the first) | 9 pts each | 54 |
+| Custom modules | 6 pts each | 30 |
+| Custom theme (flat) | 12 pts | — |
+| Contrib modules | 1 pt each | 8 |
+| Views | 2 pts each | 12 |
+| Taxonomy in use / volume | 4 pts flat + 0.5/term beyond 3 | 6 (volume part) |
+| Page groups (beyond 5) | 0.4 pt each | 10 |
+| Commerce / Multilingual / Open registration / Webform / Media / Image styles / Search / Login | 16 / 12 / 6 / 3 / 3 / 2 / 1 / 1 pts flat | — |
+
+**Content-type diversity dominates deliberately**: each distinct content type
+needs its own field-mapping/migration logic, while repetitive same-type pages
+are handled by one bulk rule — so a 200-page, one-content-type site scores
+*simpler* than a 20-page, ten-content-type site. Page/group count is weighted
+lightly on purpose — it's a proxy for migration *time*, not *difficulty*. All
+weights live as named constants in `isdrupal/small_site.py` and are a
+starting proposal, not gospel — retune against real sites as needed.
+
+| Score | Verdict |
+|---|---|
+| 80-100 | Simple |
+| 60-79 | Moderate |
+| 35-59 | Complex |
+| 0-34 | Very Complex |
+
+### CLI
+
+```bash
+python3 isDrupal_threaded.py https://old-site.example.com --check-simplicity
+python3 isDrupal_threaded.py https://old-site.example.com --check-simplicity -v   # + score breakdown
+python3 isDrupal_threaded.py -i domains.csv --check-simplicity -w 20
+```
+
+`--check-simplicity` is a no-op (with a debug note under `-d`) unless the
+site is confirmed Drupal 6/7. Output goes to `<input>_output.csv` (same
+naming as plain detection), with columns ordered **original columns first,
+then `drupal_result`, then the simplicity columns** — so your source data
+stays immediately visible instead of buried after two dozen result columns.
+In CSV mode, every row gets the full `SIMPLICITY_CSV_FIELDNAMES` column block
+(score, verdict, page groups, raw URL count, content types, custom/contrib
+modules, custom theme, Views, taxonomy term count, and one `simplicity_has_*`
+boolean column per feature flag — see `isdrupal/small_site.py`), blank for
+rows that weren't Drupal 6/7 or weren't checked. Structured columns (rather
+than one text blob) were a deliberate choice: the point of batch-checking
+simplicity is triaging a list of domains by migration effort, and separate
+columns are sortable/filterable in Excel/Sheets in a way a single text
+column isn't. The web app's CSV download follows the same column order and
+filename convention (`<uploaded-file>_output.csv`).
+
+### Web app
+
+Both the single-URL and CSV panels have a "Check migration simplicity"
+checkbox next to Fast/Drupal-only — checking it folds the crawl into the same
+request/job, running only for domains that come back confirmed Drupal 6/7.
+
+### Batch-mode concurrency trade-off
+
+CLI CSV mode and the web app's CSV upload both share the same worker pool
+(`-w/--workers` / `ISDRUPAL_WORKERS`) for both plain detection and simplicity
+crawls — there's no separate concurrency knob for "how many simplicity
+crawls run at once." Any domain that resolves to confirmed Drupal 6/7 and has
+simplicity checking enabled ties up its worker slot for a full site crawl
+instead of a single detection call, so a batch with a high Drupal 6/7 hit
+rate can see wall-clock time grow substantially. Mitigated by being
+opt-in/default-off; a dedicated concurrency knob is a reasonable follow-up if
+this proves necessary in practice.
+
+---
+
 ## Drupal 6, 7 check
 JS global:        Drupal.settings = {...}
 Loaded via:        jQuery.extend(Drupal.settings, {...})

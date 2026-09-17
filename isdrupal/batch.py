@@ -16,7 +16,12 @@ from .core import DrupalResult, detect_drupal, make_session
 from .log import get_logger
 
 
-def _check_one(domain: str, cfg: DetectConfig) -> DrupalResult:
+def _check_one(
+    domain: str,
+    cfg: DetectConfig,
+    check_simplicity: bool = False,
+    simplicity_kwargs: dict | None = None,
+) -> DrupalResult:
     domain = (domain or "").strip()
     if not domain:
         return DrupalResult(url=domain, error="empty domain")
@@ -24,13 +29,25 @@ def _check_one(domain: str, cfg: DetectConfig) -> DrupalResult:
     # threads — so different hosts can't bleed cookies/adapter state into each
     # other.
     session = make_session(cfg)
-    return detect_drupal(domain, session, cfg)
+    result = detect_drupal(domain, session, cfg)
+    if check_simplicity and result.is_drupal is True:
+        from .small_site import check_simplicity as _check_simplicity
+        from .small_site import is_drupal_6_or_7
+        if not is_drupal_6_or_7(result.drupal_version):
+            return result
+        result.simplicity = _check_simplicity(
+            result.url, session, cfg, drupal_version=result.drupal_version,
+            **(simplicity_kwargs or {}),
+        )
+    return result
 
 
 def run_batch(
     domains: Sequence[str],
     cfg: DetectConfig,
     workers: int = 10,
+    check_simplicity: bool = False,
+    simplicity_kwargs: dict | None = None,
 ) -> Iterator[tuple[int, str, DrupalResult]]:
     """Check `domains` concurrently, yielding results in input order.
 
@@ -38,6 +55,11 @@ def run_batch(
     ``workers * 2``), so at most that many futures are ever in flight regardless
     of how many domains there are. Completions can arrive out of order, so they
     are buffered in `pending` just long enough to emit in the original order.
+
+    `check_simplicity=True` runs isdrupal.small_site.check_simplicity for any
+    domain that comes back confirmed Drupal 6/7, sharing this same worker slot
+    (there's no separate concurrency knob for simplicity crawls) — a mixed
+    batch with a high D6/7 hit rate can see wall-clock time grow substantially.
     """
     logger = get_logger(cfg.log_file) if cfg.log_file else None
     if logger:
@@ -55,7 +77,7 @@ def run_batch(
                 idx, domain = next(row_iter)
             except StopIteration:
                 return False
-            in_flight[ex.submit(_check_one, domain, cfg)] = (idx, domain)
+            in_flight[ex.submit(_check_one, domain, cfg, check_simplicity, simplicity_kwargs)] = (idx, domain)
             return True
 
         for _ in range(max(workers, 1) * 2):
