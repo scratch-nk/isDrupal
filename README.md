@@ -2,6 +2,7 @@
 
 Determine if a given URL points to a Drupal site or not. Determine if the site is Drupal 6/7/8/9/10/11 if possible.
 
+
 ---
 
 ## Two ways to run it
